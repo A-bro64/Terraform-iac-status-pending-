@@ -1,0 +1,1556 @@
+provider "aws" {
+
+  region = "us-west-1"
+}
+
+########################
+
+#   Creates hosted zone in RT53
+resource "aws_route53_zone" "cloudstartP" {
+  name = "Cloudstars2021.com"
+}
+
+#   Creates record in hosted zone RT53
+resource "aws_route53_record" "www" {
+  zone_id = aws_route53_zone.cloudstartP.zone_id
+  name    = "www.Cloudstars2021.com"
+  type    = "A"
+  alias {
+    name                   = "dualstack.bastion-host"
+    zone_id                = "us-west-1"
+    evaluate_target_health = true
+
+  }
+}
+
+#   Outputs the 4 DNS servers that route traffic to DNS record
+output "name_server" {
+  value = aws_route53_zone.cloudstartP.name_servers
+}
+
+
+##############################
+
+# -= APP =- 
+# Template for App
+resource "aws_launch_configuration" "cloud-app-launch-config" {
+  image_id        = "ami-047a51fa27710816e"
+  instance_type   = "t2.micro"
+  security_groups = [aws_security_group.cloud-app-sg.id]
+  #iam_instance_profile = aws_iam_instance_profile.cloud-ec2-profile.name #it was issue here with sintax
+  user_data = file("/home/ec2-user/Project/project2/data.sh")
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Auto Scaling Group for App tier
+resource "aws_autoscaling_group" "cloud_app_asg" {
+  launch_configuration = aws_launch_configuration.cloud-app-launch-config.id
+  vpc_zone_identifier  = [aws_subnet.private1.id, aws_subnet.private2.id]
+  min_size             = 2
+  max_size             = 6
+  desired_capacity     = 4
+  target_group_arns    = [aws_lb_target_group.app_alb_target_group.arn]
+  health_check_type    = "ELB"
+  tag {
+    key                 = "Name"
+    value               = "cloud-app-asg"
+    propagate_at_launch = true
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+#  web application load balancer for public access
+resource "aws_lb" "cloud_app_elb" {
+  name               = "cloud-app-elb"
+  load_balancer_type = "application"
+  internal           = true
+  subnets = [aws_subnet.private1.id,
+  aws_subnet.private2.id]
+  security_groups = [aws_security_group.cloud-app-sg.id]
+  idle_timeout    = 30 #timeout
+  tags = {
+    name = "cloud_app_elb"
+  }
+}
+
+# Application Load balancer listeners will be created
+resource "aws_lb_listener" "app_alb_listener" {
+  load_balancer_arn = aws_lb.cloud_app_elb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    target_group_arn = aws_lb_target_group.app_alb_target_group.arn
+    type             = "forward"
+  }
+}
+
+### Target Group for ALB 
+resource "aws_lb_target_group" "app_alb_target_group" {
+  name     = "app-alb-target-group"
+  port     = "80"
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.vpc2021.id
+  tags = {
+    name = "alb_target_group"
+  }
+  health_check {
+    healthy_threshold   = 5  # healthy_threshold
+    unhealthy_threshold = 5  # unhealthy_threshold
+    timeout             = 30 # timeout
+    interval            = 60 # interval
+  }
+}
+
+resource "aws_autoscaling_attachment" "cloud_app_asg" {
+  alb_target_group_arn   = aws_lb_target_group.app_alb_target_group.arn
+  autoscaling_group_name = aws_autoscaling_group.cloud_app_asg.id
+}
+
+################################********************************************
+
+###############*****************************
+data "aws_ami" "linux-ami-id" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm*"]
+  }
+}
+##########################************
+
+# ---= RDS =---
+
+resource "aws_db_instance" "cloudstars_db" {
+  allocated_storage       = 10
+  storage_type            = "gp2"
+  engine                  = "mysql"
+  engine_version          = "5.7.42"
+  instance_class          = "db.t3.micro"
+  name                    = "cloudstars_db"
+  username                = "admin"
+  password                = "CloudStars_2021"
+  db_subnet_group_name    = aws_db_subnet_group.data-subnet-group.name
+  vpc_security_group_ids  = [aws_security_group.rds_sg.id]
+  skip_final_snapshot     = true
+  availability_zone       = "us-west-1"
+  apply_immediately       = false
+  backup_retention_period = 15
+  deletion_protection     = false
+  publicly_accessible     = false
+  #enabled_cloudwatch_logs_exports = general
+  iam_database_authentication_enabled = true
+  #replicate_source_db     =   ##KMS_key_id must be specified
+}
+
+
+#RDS Security Group
+resource "aws_security_group" "rds_sg" {
+  name        = "rds_sg"
+  description = "Used for RDS instances"
+  vpc_id      = aws_vpc.vpc2021.id
+
+  #SQL access from public and private SGs
+  ingress {
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.cloud-app-sg.id, aws_security_group.cloud-web-sg.id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+##Create Subnet Group for Data base
+resource "aws_db_subnet_group" "data-subnet-group" {
+  name       = "data-subnet-group"
+  subnet_ids = [aws_subnet.private1.id, aws_subnet.private2.id, aws_subnet.private3.id, aws_subnet.private4.id]
+
+  tags = {
+    Name = "DB subnet group"
+  }
+}
+
+#  resource aws_db_instance "default" {
+#    allocated_storage    = 10
+#    engine               = "mysql"
+#    engine_version       = 5.7
+#    instance_class       = "db.t3.micro"
+#    name                 = "mydb"
+#    username             = "admin"
+#    password             = "CloudStars_2021"
+#    parameter_group_name = aws_db_parameter_group.default.name
+#    skip_final_snapshot  = true
+#    db_subnet_group_name = aws_db_subnet_group.cloudam1-db-group.name
+#    multi_az             = true
+#    security_group_names =
+#  }
+
+#  resource "aws_db_parameter_group" "default" {
+#   name   = "rds-pg"
+#   family = "mysql5.7"
+
+#   parameter {
+#     name  = "character_set_server"
+#     value = "utf8"
+#   }
+
+# }
+
+# resource "aws_db_subnet_group" "cloud-db-group" {
+#   name       = "vpc2021"
+#   subnet_ids = [aws_subnet.private3.id, aws_subnet.private4.id]
+
+#   tags = {
+#     Name = "data DB subnet group"
+#   }
+# }
+
+# module "cloudwatch-logs-exporter" {
+#   source           = "gadgetry-io/cloudwatch-logs-exporter/aws"
+#   version          = "latest version"
+
+#   name             = "vpc-flow-logs"
+#   log_group        = "/prd/vpc_flow_logs"
+#   s3_bucket        = "my-s3-bucket"
+#   s3_prefix        = "cloudwatch/prd/vpc_flow_logs"
+# }
+
+
+# resource "aws_db_instance" "data_replica_db" {
+
+#   instance_class         = var.db_instance_class
+#   vpc_security_group_ids = [aws_security_group.rds_sg.id]
+#   availability_zone      = data.aws_availability_zones.available.names[1]
+
+#   replicate_source_db = aws_db_instance.group3_primary_db.id
+# }
+
+#######################################
+resource "aws_iam_group_membership" "SysAdmin" {
+  name = "SysAdmin"
+  users = [
+    aws_iam_user.SysAdmin1.name,
+    aws_iam_user.SysAdmin2.name,
+  ]
+  group = aws_iam_group.SysAdmin.name
+}
+resource "aws_iam_group" "SysAdmin" {
+  name = "SysAdmin"
+}
+resource "aws_iam_user" "SysAdmin1" {
+  name = "SysAdmin1"
+}
+resource "aws_iam_user" "SysAdmin2" {
+  name = "SysAdmin2"
+}
+## iam login profiles can be configured by Downloading KeybaseApp to Local enviroment
+# resource "aws_iam_user_login_profile" "SysAdmin1" {
+#   user            = "SysAdmin1"
+#   pgp_key         = "keybase:CloudStars_2021" #Keybase:example --example means the account name of the user with the pgp key
+#   password_length = 10
+# }
+
+# resource "aws_iam_user_login_profile" "SysAdmin2" {
+#   user            = "SysAdmin2"
+#   pgp_key         = "keybase:CloudStars_2021" #Keybase:example --example means the account name of the user with the pgp key
+#   password_length = 10
+# }
+
+resource "aws_iam_group_policy" "SysAdmin_policy" {
+  name  = "SysAdmin_policy"
+  group = aws_iam_group.SysAdmin.id
+
+  policy = <<EOF
+{
+    "Statement": [
+        {
+            "Action": [
+                "acm:Describe*",
+                "acm:Get*",
+                "acm:List*",
+                "acm:Request*",
+                "acm:Resend*",
+                "autoscaling:*",
+                "cloudtrail:DescribeTrails",
+                "cloudtrail:GetTrailStatus",
+                "cloudtrail:ListPublicKeys",
+                "cloudtrail:ListTags",
+                "cloudtrail:LookupEvents",
+                "cloudtrail:StartLogging",
+                "cloudtrail:StopLogging",
+                "cloudwatch:*",
+                "codecommit:BatchGetRepositories",
+                "codecommit:CreateBranch",
+                "codecommit:CreateRepository",
+                "codecommit:Get*",
+                "codecommit:GitPull",
+                "codecommit:GitPush",
+                "codecommit:List*",
+                "codecommit:Put*",
+                "codecommit:Test*",
+                "codecommit:Update*",
+                "codedeploy:*",
+                "codepipeline:*",
+                "config:*",
+                "ds:*",
+                "ec2:*",
+                "elasticloadbalancing:*",
+                "events:*",
+                "iam:GetAccount*",
+                "iam:GetContextKeys*",
+                "iam:GetCredentialReport",
+                "iam:ListAccountAliases",
+                "iam:ListGroups",
+                "iam:ListOpenIDConnectProviders",
+                "iam:ListPolicies",
+                "iam:ListPoliciesGrantingServiceAccess",
+                "iam:ListRoles",
+                "iam:ListSAMLProviders",
+                "iam:ListServerCertificates",
+                "iam:Simulate*",
+                "iam:UpdateServerCertificate",
+                "iam:UpdateSigningCertificate",
+                "kinesis:ListStreams",
+                "kinesis:PutRecord",
+                "kms:CreateAlias",
+                "kms:CreateKey",
+                "kms:DeleteAlias",
+                "kms:Describe*",
+                "kms:GenerateRandom",
+                "kms:Get*",
+                "kms:List*",
+                "kms:Encrypt",
+                "kms:ReEncrypt*",
+                "lambda:Create*",
+                "lambda:Delete*",
+                "lambda:Get*",
+                "lambda:InvokeFunction",
+                "lambda:List*",
+                "lambda:PublishVersion",
+                "lambda:Update*",
+                "logs:*",
+                "rds:Describe*",
+                "rds:ListTagsForResource",
+                "route53:*",
+                "route53domains:*",
+                "ses:*",
+                "sns:*",
+                "sqs:*",
+                "trustedadvisor:*"
+            ],
+            "Effect": "Allow",
+            "Resource": "*"
+        },
+        {
+            "Action": [
+                "ec2:AcceptVpcPeeringConnection",
+                "ec2:AttachClassicLinkVpc",
+                "ec2:AttachVolume",
+                "ec2:AuthorizeSecurityGroupEgress",
+                "ec2:AuthorizeSecurityGroupIngress",
+                "ec2:CreateVpcPeeringConnection",
+                "ec2:DeleteCustomerGateway",
+                "ec2:DeleteDhcpOptions",
+                "ec2:DeleteInternetGateway",
+                "ec2:DeleteNetworkAcl*",
+                "ec2:DeleteRoute",
+                "ec2:DeleteRouteTable",
+                "ec2:DeleteSecurityGroup",
+                "ec2:DeleteVolume",
+                "ec2:DeleteVpcPeeringConnection",
+                "ec2:DetachClassicLinkVpc",
+                "ec2:DetachVolume",
+                "ec2:DisableVpcClassicLink",
+                "ec2:EnableVpcClassicLink",
+                "ec2:GetConsoleScreenshot",
+                "ec2:RebootInstances",
+                "ec2:RejectVpcPeeringConnection",
+                "ec2:RevokeSecurityGroupEgress",
+                "ec2:RevokeSecurityGroupIngress",
+                "ec2:RunInstances",
+                "ec2:StartInstances",
+                "ec2:StopInstances",
+                "ec2:TerminateInstances"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+                "*"
+            ]
+        },
+        {
+            "Action": "s3:*",
+            "Effect": "Allow",
+            "Resource": [
+                "*"
+            ]
+        },
+        {
+            "Action": [
+                "iam:GetAccessKeyLastUsed",
+                "iam:GetGroup*",
+                "iam:GetInstanceProfile",
+                "iam:GetLoginProfile",
+                "iam:GetOpenIDConnectProvider",
+                "iam:GetPolicy*",
+                "iam:GetRole*",
+                "iam:GetSAMLProvider",
+                "iam:GetSSHPublicKey",
+                "iam:GetServerCertificate",
+                "iam:GetServiceLastAccessed*",
+                "iam:GetUser*",
+                "iam:ListAccessKeys",
+                "iam:ListAttached*",
+                "iam:ListEntitiesForPolicy",
+                "iam:ListGroupPolicies",
+                "iam:ListGroupsForUser",
+                "iam:ListInstanceProfiles*",
+                "iam:ListMFADevices",
+                "iam:ListPolicyVersions",
+                "iam:ListRolePolicies",
+                "iam:ListSSHPublicKeys",
+                "iam:ListSigningCertificates",
+                "iam:ListUserPolicies",
+                "iam:Upload*"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+                "*"
+            ]
+        },
+        {
+            "Action": [
+                "iam:GetRole",
+                "iam:ListRoles",
+                "iam:PassRole"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+                "arn:aws:iam::*:role/rds-monitoring-role",
+                "arn:aws:iam::*:role/ec2-sysadmin-*",
+                "arn:aws:iam::*:role/ecr-sysadmin-*",
+                "arn:aws:iam::*:role/lambda-sysadmin-*"
+            ]
+        }
+    ],
+    "Version": "2012-10-17"
+}
+EOF
+}
+#DATABASE ADMINS CREATED
+resource "aws_iam_group_membership" "DBAdmin" {
+  name = "DBAdmin"
+  users = [
+
+    aws_iam_user.DBAdmin1.name,
+    aws_iam_user.DBAdmin2.name,
+
+  ]
+  group = aws_iam_group.DBAdmin.name
+}
+resource "aws_iam_group" "DBAdmin" {
+  name = "DBAdmin"
+}
+resource "aws_iam_user" "DBAdmin1" {
+  name = "DBAdmin1"
+}
+resource "aws_iam_user" "DBAdmin2" {
+  name = "DBAdmin2"
+}
+# resource "aws_iam_user_login_profile" "DBAdmin1" {
+#   user            = "DBAdmin1"
+#   pgp_key         = "keybase:CloudStars_2021" #Keybase:example --example means the account name of the user with the pgp key
+#   password_length = 10
+# }
+# resource "aws_iam_user_login_profile" "DBAdmin2" {
+#   user            = "DBAdmin2"
+#   pgp_key         = "keybase:CloudStars_2021" #Keybase:example --example means the account name of the user with the pgp key
+#   password_length = 10
+# }
+resource "aws_iam_account_password_policy" "strict" {
+  require_lowercase_characters = true
+  require_numbers              = true
+  require_uppercase_characters = true
+  require_symbols              = true
+  max_password_age             = 90
+  password_reuse_prevention    = 3
+  minimum_password_length      = 8
+}
+resource "aws_iam_group_policy" "DBAdmin_policy" {
+  name   = "DBAdmin_policy"
+  group  = aws_iam_group.DBAdmin.name
+  policy = <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "cloudwatch:DeleteAlarms",
+                "cloudwatch:Describe*",
+                "cloudwatch:DisableAlarmActions",
+                "cloudwatch:EnableAlarmActions",
+                "cloudwatch:Get*",
+                "cloudwatch:List*",
+                "cloudwatch:PutMetricAlarm",
+                "datapipeline:ActivatePipeline",
+                "datapipeline:CreatePipeline",
+                "datapipeline:DeletePipeline",
+                "datapipeline:DescribeObjects",
+                "datapipeline:DescribePipelines",
+                "datapipeline:GetPipelineDefinition",
+                "datapipeline:ListPipelines",
+                "datapipeline:PutPipelineDefinition",
+                "datapipeline:QueryObjects",
+                "dynamodb:*",
+                "ec2:DescribeAccountAttributes",
+                "ec2:DescribeAddresses",
+                "ec2:DescribeAvailabilityZones",
+                "ec2:DescribeInternetGateways",
+                "ec2:DescribeSecurityGroups",
+                "ec2:DescribeSubnets",
+                "ec2:DescribeVpcs",
+                "elasticache:*",
+                "iam:ListRoles",
+                "iam:GetRole",
+                "kms:ListKeys",
+                "lambda:CreateEventSourceMapping",
+                "lambda:CreateFunction",
+                "lambda:DeleteEventSourceMapping",
+                "lambda:DeleteFunction",
+                "lambda:GetFunctionConfiguration",
+                "lambda:ListEventSourceMappings",
+                "lambda:ListFunctions",
+                "logs:DescribeLogGroups",
+                "logs:DescribeLogStreams",
+                "logs:FilterLogEvents",
+                "logs:GetLogEvents",
+                "logs:Create*",
+                "logs:PutLogEvents",
+                "logs:PutMetricFilter",
+                "rds:*",
+                "redshift:*",
+                "s3:CreateBucket",
+                "sns:CreateTopic",
+                "sns:DeleteTopic",
+                "sns:Get*",
+                "sns:List*",
+                "sns:SetTopicAttributes",
+                "sns:Subscribe",
+                "sns:Unsubscribe"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:AbortMultipartUpload",
+                "s3:DeleteObject*",
+                "s3:Get*",
+                "s3:List*",
+                "s3:PutAccelerateConfiguration",
+                "s3:PutBucketTagging",
+                "s3:PutBucketVersioning",
+                "s3:PutBucketWebsite",
+                "s3:PutLifecycleConfiguration",
+                "s3:PutReplicationConfiguration",
+                "s3:PutObject*",
+                "s3:Replicate*",
+                "s3:RestoreObject"
+            ],
+            "Resource": [
+                "*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "iam:PassRole"
+            ],
+            "Resource": [
+                "arn:aws:iam::*:role/rds-monitoring-role",
+                "arn:aws:iam::*:role/rdbms-lambda-access",
+                "arn:aws:iam::*:role/lambda_exec_role",
+                "arn:aws:iam::*:role/lambda-dynamodb-*",
+                "arn:aws:iam::*:role/lambda-vpc-execution-role",
+                "arn:aws:iam::*:role/DataPipelineDefaultRole",
+                "arn:aws:iam::*:role/DataPipelineDefaultResourceRole"
+            ]
+        }
+    ]
+}
+EOF
+}
+
+#CREATE MONITOR GROUP AND USERS
+
+resource "aws_iam_group_membership" "Monitor" {
+  name = "Monitor"
+  users = [
+    aws_iam_user.Monitor1.name,
+    aws_iam_user.Monitor2.name,
+    aws_iam_user.Monitor3.name,
+    aws_iam_user.Monitor4.name,
+  ]
+  group = aws_iam_group.Monitor.name
+}
+resource "aws_iam_group" "Monitor" {
+  name = "Monitor"
+}
+resource "aws_iam_user" "Monitor1" {
+  name = "Monitor1"
+}
+resource "aws_iam_user" "Monitor2" {
+  name = "Monitor2"
+}
+resource "aws_iam_user" "Monitor3" {
+  name = "Monitor3"
+}
+resource "aws_iam_user" "Monitor4" {
+  name = "Monitor4"
+}
+# resource "aws_iam_user_login_profile" "Monitor1" {
+#   user            = "Monitor1"
+#   pgp_key         = "keybase:CloudStars_2021" #Keybase:example --example means the account name of the user with the pgp key
+#   password_length = 12
+# }
+# resource "aws_iam_user_login_profile" "Monitor2" {
+#   user            = "Monitor2"
+#   pgp_key         = "keybase:CloudStars_2021"
+#   password_length = 12
+# }
+# resource "aws_iam_user_login_profile" "Monitor3" {
+#   user            = "Monitor3"
+#   pgp_key         = "keybase:CloudStars_2021"
+#   password_length = 12
+# }
+# resource "aws_iam_user_login_profile" "Monitor4" {
+#   user            = "Monitor4"
+#   pgp_key         = "keybase:CloudStars_2021"
+#   password_length = 12
+# }
+
+resource "aws_iam_group_policy" "Monitor_policy" {
+  name   = "Monitor_policy"
+  group  = aws_iam_group.Monitor.id
+  policy = <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "VisualEditor0",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:GetEbsEncryptionByDefault",
+                "s3:GetObjectVersionTagging",
+                "ec2:DescribeVolumesModifications",
+                "ec2:GetHostReservationPurchasePreview",
+                "ec2:GetConsoleScreenshot",
+                "s3:GetObjectAcl",
+                "s3:GetBucketObjectLockConfiguration",
+                "ec2:GetLaunchTemplateData",
+                "ec2:DescribeScheduledInstanceAvailability",
+                "rds:DownloadDBLogFilePortion",
+                "ec2:GetEbsDefaultKmsKeyId",
+                "s3:GetObjectVersionAcl",
+                "s3:GetBucketPolicyStatus",
+                "ec2:GetManagedPrefixListEntries",
+                "s3:GetObjectRetention",
+                "s3:GetBucketWebsite",
+                "s3:GetJobTagging",
+                "ec2:DescribeVpnConnections",
+                "s3:ListJobs",
+                "ec2:DescribeFastSnapshotRestores",
+                "s3:GetObjectLegalHold",
+                "s3:GetBucketNotification",
+                "ec2:GetReservedInstancesExchangeQuote",
+                "s3:GetReplicationConfiguration",
+                "s3:ListMultipartUploadParts",
+                "s3:GetObject",
+                "ec2:GetPasswordData",
+                "ec2:DescribeScheduledInstances",
+                "s3:DescribeJob",
+                "s3:GetAnalyticsConfiguration",
+                "ec2:DescribeElasticGpus",
+                "s3:GetObjectVersionForReplication",
+                "s3:GetAccessPoint",
+                "s3:GetLifecycleConfiguration",
+                "ec2:GetDefaultCreditSpecification",
+                "s3:GetBucketTagging",
+                "s3:GetInventoryConfiguration",
+                "s3:ListBucketVersions",
+                "s3:GetBucketLogging",
+                "ec2:GetCapacityReservationUsage",
+                "s3:GetAccelerateConfiguration",
+                "s3:GetBucketPolicy",
+                "ec2:GetConsoleOutput",
+                "s3:GetObjectVersionTorrent",
+                "s3:GetEncryptionConfiguration",
+                "s3:GetBucketRequestPayment",
+                "s3:GetAccessPointPolicyStatus",
+                "s3:GetObjectTagging",
+                "s3:GetMetricsConfiguration",
+                "s3:GetBucketPublicAccessBlock",
+                "s3:ListBucketMultipartUploads",
+                "s3:ListAccessPoints",
+                "ec2:DescribeTags",
+                "ec2:GetCoipPoolUsage",
+                "s3:GetBucketVersioning",
+                "s3:GetBucketAcl",
+                "s3:GetObjectTorrent",
+                "s3:GetAccountPublicAccessBlock",
+                "rds:ListTagsForResource",
+                "ec2:GetManagedPrefixListAssociations",
+                "s3:GetBucketCORS",
+                "s3:GetBucketLocation",
+                "s3:GetAccessPointPolicy",
+                "s3:GetObjectVersion"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+EOF
+}
+####################################
+resource "aws_iam_role" "ec2_iam_role" {
+  name               = "team1-ec2_iam_role"
+  path               = "/"
+  assume_role_policy = <<EOF
+{
+  "Version" : "2012-10-17",
+  "Statement" :
+  [
+    {
+      "Effect" : "Allow",
+      "Principal" : {
+        "Service" : ["ssm.amazonaws.com"]
+      },
+      "Action" : "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+}
+resource "aws_iam_instance_profile" "team1-ec2-profile" {
+  name = "ec2_instance_profile123"
+  role = aws_iam_role.ec2_iam_role.name
+}
+
+#Create a instance profile for bastion host to comminucate to web, app servers
+################################
+output "public_ip" {
+  value = aws_instance.bastion-host.public_ip
+}
+
+output "private_ip" {
+  value = aws_instance.bastion-host.private_ip
+}
+
+output "basTion_id" {
+  value = aws_instance.bastion-host.id
+}
+###################################
+resource "aws_s3_bucket" "gogreenbystars-cloud-2021" {
+  bucket = "gogreenbystars-cloud-2021"
+  acl    = "private"
+
+  lifecycle_rule {
+    id      = "log"
+    enabled = true
+
+    prefix = "log/"
+
+    tags = {
+      rule      = "log"
+      autoclean = "true"
+    }
+
+
+    transition {
+      days          = 60
+      storage_class = "GLACIER"
+    }
+
+    expiration {
+      days = 365
+    }
+  }
+
+  lifecycle_rule {
+    id      = "tmp"
+    prefix  = "tmp/"
+    enabled = true
+
+    expiration {
+      date = "2022-01-12"
+    }
+  }
+}
+###########################################
+
+resource "aws_security_group" "cloud-ec2-sg" {
+  name        = "cloud-ec2-sg"
+  description = "Allow ssh from anywhere inbound traffic"
+  vpc_id      = aws_vpc.vpc2021.id
+
+  ingress {
+    description = "SSH from VPC"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.vpc2021.cidr_block]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "allow_SSH"
+  }
+}
+
+
+##SECURITY GROUP FOR WEB TIER
+
+##create app security group
+
+resource "aws_security_group" "cloud-app-sg" {
+  name        = "allow_http"
+  description = "Allow http inbound traffic"
+  vpc_id      = aws_vpc.vpc2021.id
+
+  ingress {
+    description = "http from VPC"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.vpc2021.cidr_block]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "app-allow_http"
+  }
+}
+
+
+##create web security group
+
+resource "aws_security_group" "cloud-web-sg" {
+  name        = "web_allow_http"
+  description = "Allow http inbound traffic"
+  vpc_id      = aws_vpc.vpc2021.id
+
+  ingress {
+    description = "http from everywhere"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "web-allow_http"
+  }
+}
+
+
+##Bastion Security Group 
+
+resource "aws_security_group" "Bastion-Host-Sg" {
+  name        = "allow_http_for_Bastion"
+  description = "Allow http inbound traffic"
+  vpc_id      = aws_vpc.vpc2021.id
+
+  ingress {
+    description = "http from everywhere"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "ssh from everywhere"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "app-allow_http&ssh"
+  }
+}
+#####################################################################
+resource "aws_sns_topic" "alertstars" {
+  name            = "alertstars"
+  delivery_policy = <<EOF
+{
+  "http": {
+    "defaultHealthyRetryPolicy": {
+      "minDelayTarget": 20,
+      "maxDelayTarget": 20,
+      "numRetries": 3,
+      "numMaxDelayRetries": 0,
+      "numNoDelayRetries": 0,
+      "numMinDelayRetries": 0,
+      "backoffFunction": "linear"
+    },
+    "disableSubscriptionOverrides": false,
+    "defaultThrottlePolicy": {
+      "maxReceivesPerSecond": 1
+    }
+  }
+}
+EOF
+}
+resource "aws_sns_topic_subscription" "alertstars" {
+  topic_arn = aws_sns_topic.alertstars.id
+  protocol  = "sms"
+  endpoint  = "7039013707" # Ivan`s phone number
+}
+
+resource "aws_cloudwatch_metric_alarm" "nlb_healthyhosts" {
+  alarm_name          = "alarmname"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "HealthyHostCount"
+  namespace           = "AWS/NetworkELB"
+  period              = "60"
+  statistic           = "Average"
+  threshold           = "80"
+  alarm_description   = "Number of healthy nodes in Target Group"
+  actions_enabled     = "true"
+  alarm_actions       = [aws_sns_topic.alertstars.arn]
+  ok_actions          = [aws_sns_topic.alertstars.arn]
+  dimensions = {
+    TargetGroup  = "aws_lb_target_group.web_tg.arn"
+    LoadBalancer = "aws_lb.web_lb.arn"
+  }
+}
+###########################################
+resource "aws_s3_bucket" "bastion_host" {
+  bucket = "s3-website-test.hashicorp.com"
+  acl    = "public-read"
+
+  website {
+    index_document = "index.htmls"
+    error_document = "error.html"
+
+    routing_rules = <<EOF
+[{
+    "Condition": {
+        "KeyPrefixEquals": "docs/"
+    },
+    "Redirect": {
+        "ReplaceKeyPrefixWith": "documents/"
+    }
+}]
+EOF
+  }
+}
+####################################
+
+#variable "aws_region" {}
+
+#variable "aws_profile" {}
+
+
+
+#variable "vpc_cidr" {}
+#variable "key_name" {
+#  type = string
+#}
+
+#data "aws_availability_zones" "available" {}
+
+#variable "cidrs" {
+#  type = map(string)
+#}
+
+#variable "db_instance_class" {}
+#variable "db_name" {}
+#variable "db_user" {}
+#variable "db_password" {}
+#variable "db_bak_retention" {}
+#variable "db_port" {}
+
+#variable "elb_healthy_threshold" {}
+#variable "elb_unhealthy_threshold" {}
+#variable "elb_timeout" {}
+#variable "elb_interval" {}
+#variable "elb_drain_timeout" {}
+#variable "elb_idle_timeout" {}
+
+
+
+##variable "web_ami" {}
+#variable "web_lc_instance_type" {}
+#variable "asg_web_max" {}
+#variable "asg_web_min" {}
+#variable "asg_web_grace" {}
+#variable "asg_web_hct" {}
+#variable "asg_web_cap" {}
+
+
+
+##variable "app_ami" {}
+#variable "app_lc_instance_type" {}
+#variable "asg_app_max" {}
+#variable "asg_app_min" {}
+#variable "asg_app_grace" {}
+#variable "asg_app_hct" {}
+#variable "asg_app_cap" {}
+
+#variable "zone_id" {}
+#variable "route53_dns" {}
+
+#variable "alias" {
+#  type        = map
+#  default     = {}
+#  description = "An alias block. Conflicts with ttl & records. Alias record documented below."
+#}
+#variable stack {
+#  description = "this is name for tags"
+#  default     = "terraform"
+#}
+
+
+variable "alarms_sns" {
+  default = ["nilyuferk@gmail.com", "abrorshermanov@gmail.com", "roslyaka@gmail.com", "kf7407@gmail.com", "abdu.v.sherman@gmail.com", "snabieva1996@gmail.com"]
+}
+###########################################
+terraform {
+  required_version = ">= 0.15"
+}
+
+
+terraform {
+  required_providers {
+    aws = {
+      version = ">= 3.45.0"
+      source  = "hashicorp/aws"
+    }
+  }
+}
+############################
+# Create Vpc Cloud stars
+resource "aws_vpc" "vpc2021" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = {
+    Name = "vpc2021"
+  }
+}
+# IG
+resource "aws_internet_gateway" "Cloud-IG" {
+  vpc_id = aws_vpc.vpc2021.id
+
+  tags = {
+    Name = "Cloud-IG"
+  }
+}
+
+# Eip and Nat-G
+resource "aws_eip" "cloud-eip" {
+  vpc                       = true
+  associate_with_private_ip = "10.0.0.5"
+}
+resource "aws_nat_gateway" "cloud-nat" {
+  allocation_id = aws_eip.cloud-eip.id
+  subnet_id     = aws_subnet.public1.id
+  depends_on    = [aws_eip.cloud-eip]
+
+  tags = {
+    Name = "cloud-NAT"
+  }
+}
+
+# Subnets
+resource "aws_subnet" "public1" {
+  vpc_id                  = aws_vpc.vpc2021.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "us-east-1a"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "public-sn-1"
+  }
+}
+
+resource "aws_subnet" "public2" {
+  vpc_id                  = aws_vpc.vpc2021.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "us-east-1b"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "public2"
+  }
+}
+
+resource "aws_subnet" "private1" {
+  vpc_id            = aws_vpc.vpc2021.id
+  cidr_block        = "10.0.3.0/24"
+  availability_zone = "us-east-1a"
+
+  tags = {
+    Name = "private1"
+  }
+}
+
+resource "aws_subnet" "private2" {
+  vpc_id            = aws_vpc.vpc2021.id
+  cidr_block        = "10.0.4.0/24"
+  availability_zone = "us-east-1b"
+
+  tags = {
+    Name = "private2"
+  }
+}
+
+resource "aws_subnet" "private3" {
+  vpc_id            = aws_vpc.vpc2021.id
+  cidr_block        = "10.0.5.0/24"
+  availability_zone = "us-east-1a"
+
+  tags = {
+    Name = "private3"
+  }
+}
+
+
+resource "aws_subnet" "private4" {
+  vpc_id            = aws_vpc.vpc2021.id
+  cidr_block        = "10.0.6.0/24"
+  availability_zone = "us-east-1b"
+
+  tags = {
+    Name = "private4"
+  }
+}
+
+# resource "aws_subnet" "privare5" {
+#   vpc_id     = aws_vpc.vpc2021.id
+#   cidr_block = "10.0.7.0/24"
+#   availability_zone = "us-east-1a"
+
+#   tags = {
+#     Name = "private-sn-5"
+#   }
+# }
+
+
+# resource "aws_subnet" "private6" {
+#   vpc_id     = aws_vpc.vpc2021.id
+#   cidr_block = "10.0.8.0/24"
+#   availability_zone = "us-east-1b"
+
+#   tags = {
+#     Name = "private-sn-6"
+#   }
+# }
+
+# public route table
+resource "aws_route_table" "public-rt" {
+  vpc_id = aws_vpc.vpc2021.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.Cloud-IG.id
+  }
+
+  # route {
+  #   ipv6_cidr_block        = "::/0"
+  #   egress_only_gateway_id = aws_egress_only_internet_gateway.foo.id
+  # }
+
+  tags = {
+    Name = "cloud-public-route-table"
+  }
+}
+
+
+#Private Route table
+
+resource "aws_default_route_table" "private-rt" {
+  default_route_table_id = aws_vpc.vpc2021.default_route_table_id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_nat_gateway.cloud-nat.id
+  }
+  tags = {
+    Name = "cloud-private-route-table"
+  }
+}
+
+#Subnet associations to the route table
+resource "aws_route_table_association" "cloud_public1_assoc" {
+  subnet_id      = aws_subnet.public1.id
+  route_table_id = aws_route_table.public-rt.id
+}
+
+resource "aws_route_table_association" "cloud_public2_assoc" {
+  subnet_id      = aws_subnet.public2.id
+  route_table_id = aws_route_table.public-rt.id
+}
+
+resource "aws_route_table_association" "cloud_private1_assoc" {
+  subnet_id      = aws_subnet.private1.id
+  route_table_id = aws_default_route_table.private-rt.id
+}
+
+resource "aws_route_table_association" "cloud_private2_assoc" {
+  subnet_id      = aws_subnet.private2.id
+  route_table_id = aws_default_route_table.private-rt.id
+}
+resource "aws_route_table_association" "cloud_private3_assoc" {
+  subnet_id      = aws_subnet.private3.id
+  route_table_id = aws_default_route_table.private-rt.id
+}
+
+resource "aws_route_table_association" "cloud_private4_assoc" {
+  subnet_id      = aws_subnet.private4.id
+  route_table_id = aws_default_route_table.private-rt.id
+}
+
+# resource "aws_route_table_association" "cloud_private5_assoc" {
+#   subnet_id      = aws_subnet.privare5.id
+#   route_table_id = aws_default_route_table.private-rt.id
+# }
+
+# resource "aws_route_table_association" "cloud_private6_assoc" {
+#   subnet_id      = aws_subnet.private6.id
+#   route_table_id = aws_default_route_table.private-rt.id
+# }
+#######################################
+#  --= WEB =--
+
+# Bastion Host
+# Instance Bastion-host
+resource "aws_instance" "bastion-host" {
+  ami                         = "ami-047a51fa27710816e"
+  instance_type               = "t2.micro"
+  availability_zone           = "us-west-1"
+  associate_public_ip_address = true
+  subnet_id                   = aws_subnet.public1.id
+  user_data                   = <<-EOF
+            #!/bin/bash
+            sudo su
+            yum update -y
+            yum install httpd php php-mysql -y
+            cd /var/www/html
+            echo "healthy" > healthy.html
+            wget https://wordpress.org/wordpress-5.1.1.tar.gz
+            tar -xzf wordpress-5.1.1.tar.gz
+            cp -r wordpress/* /var/www/html/
+            rm -rf wordpress
+            rm -rf wordpress-5.1.1.tar.gz
+            chmod -R 755 wp-content
+            chown -R apache:apache wp-content
+            wget https://s3.amazonaws.com/bucketforwordpresslab-donotdelete/htaccess.txt
+            mv htaccess.txt .htaccess
+            chkconfig httpd on
+            systemctl start httpd
+            EOF
+  vpc_security_group_ids      = [aws_security_group.Bastion-Host-Sg.id]
+  tags = {
+    "Name" = "bastion-host"
+  }
+  key_name = var.instance_private_key
+}
+
+#  Launcher App Template 
+resource "aws_launch_configuration" "cloud-launch-config" {
+  image_id             = "ami-047a51fa27710816e"
+  instance_type        = "t2.micro"
+  security_groups      = [aws_security_group.cloud-app-sg.id]
+  iam_instance_profile = aws_iam_instance_profile.team1-ec2-profile.name
+  user_data            = file("/home/ec2-user/Project/project2/data.sh")
+#(We can add script for app tier or use file from my PC)
+#user_data = <<-EOF
+            #!/bin/bash
+           # yum -y install httpd php mysql php-mysql
+           # chkconfig httpd on
+            #service httpd start
+            #f [ ! -f /var/www/html/lab-app.tgz ]; then
+            #cd /var/www/html
+            #wget https://aws-tc-largeobjects.s3-us-west-2.amazonaws.com/CUR-TF-200-ACACAD/studentdownload/lab-app.tgz
+            #tar xvfz lab-app.tgz
+            #chown apache:root /var/www/html/rds.conf.php
+            #fi
+            #EOF
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+#  Auto Scaling Group for App tier
+resource "aws_autoscaling_group" "cloud_web_asg" {
+  launch_configuration = aws_launch_configuration.cloud-launch-config.id
+  vpc_zone_identifier  = [aws_subnet.private1.id, aws_subnet.private2.id]
+  min_size             = 2
+  max_size             = 6
+  desired_capacity     = 4
+  target_group_arns    = [aws_lb_target_group.alb_target_group.arn]
+  health_check_type    = "ELB"
+  tag {
+    key                 = "Name"
+    value               = "cloud-web-asg"
+    propagate_at_launch = true
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# web application load balancer for public access
+resource "aws_lb" "cloud_web_elb" {
+  name               = "cloud-app-elb"
+  load_balancer_type = "application"
+  internal           = false
+  subnets = [aws_subnet.public1.id,
+  aws_subnet.public2.id]
+  security_groups = [aws_security_group.cloud-app-sg.id]
+  idle_timeout    = 30 #elb_timeout
+
+  tags = {
+    name = "cloud_web_elb"
+  }
+}
+
+#Application Load balancer listeners will be created
+resource "aws_lb_listener" "alb_listener" {
+  load_balancer_arn = aws_lb.cloud_web_elb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    target_group_arn = aws_lb_target_group.alb_target_group.arn
+    type             = "forward"
+  }
+}
+
+# Target Group for ALB 
+resource "aws_lb_target_group" "alb_target_group" {
+  name     = "alb-target-group"
+  port     = "80"
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.vpc2021.id
+  tags = {
+    name = "alb_target_group"
+  }
+  health_check {
+    healthy_threshold   = 5  #var.elb_healthy_threshold
+    unhealthy_threshold = 5  #var.elb_unhealthy_threshold
+    timeout             = 30 #var.elb_timeout
+    interval            = 60 #var.elb_interval
+  }
+}
+
+resource "aws_autoscaling_attachment" "cloud_web_asg" {
+  alb_target_group_arn   = aws_lb_target_group.alb_target_group.arn
+  autoscaling_group_name = aws_autoscaling_group.cloud_web_asg.id
+}
+
+##########################################################
+
+variable "vpc_cidr" {
+  description = "CIDR for VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "public_subnet_1_cidr" {
+  description = "CIDR for Public Subnet 1"
+  type        = string
+  default     = "10.0.10.0/24"
+}
+
+variable "public_subnet_1_availability_zone" {
+  description = "Public Subnet 1 availability Zone"
+  type        = string
+  default     = "us-west-1a"
+}
+
+variable "public_subnet_2_cidr" {
+  description = "CIDR for Public Subnet 2"
+  type        = string
+  default     = "10.0.20.0/24"
+}
+
+variable "public_subnet_2_availability_zone" {
+  description = "Public Subnet 2 availability Zone"
+  type        = string
+  default     = "us-west-1b"
+
+}
+
+variable "private_subnet_1_cidr" {
+  description = "CIDR for Private Subnet 1"
+  type        = string
+  default     = "10.0.30.0/24"
+}
+
+variable "private_subnet_1_availability_zone" {
+  description = "Private Subnet 1 availability Zone"
+  type        = string
+  default     = "us-west-1a"
+}
+
+variable "private_subnet_2_cidr" {
+  description = "CIDR for private Subnet 2"
+  type        = string
+  default     = "10.0.40.0/24"
+}
+
+variable "private_subnet_2_availability_zone" {
+  description = "Private Subnet 2 availability Zone"
+  type        = string
+  default     = "us-west-1b"
+}
+
+variable "private_subnet_3_cidr" {
+  description = "CIDR for private Subnet 3"
+  type        = string
+  default     = "10.0.50.0/24"
+}
+
+variable "private_subnet_3_availability_zone" {
+  description = "Private Subnet 3 availability Zone"
+  type        = string
+  default     = "us-west-1a"
+}
+
+variable "private_subnet_4_cidr" {
+  description = "CIDR for private Subnet 4"
+  type        = string
+  default     = "10.0.60.0/24"
+}
+
+variable "private_subnet_4_availability_zone" {
+  description = "Private Subnet 4 availability Zone"
+  type        = string
+  default     = "us-west-1b"
+}
+
+variable "DB_subnet_1_cidr" {
+  description = "CIDR for DB Subnet 1"
+  type        = string
+  default     = "10.0.70.0/24"
+}
+
+variable "DB_subnet_1_availability_zone" {
+  description = "DB Subnet 1 availability Zone"
+  type        = string
+  default     = "us-west-1a"
+}
+
+variable "DB_subnet_2_cidr" {
+  description = "CIDR for DB Subnet 2"
+  type        = string
+  default     = "10.0.80.0/24"
+}
+
+variable "DB_subnet_2_availability_zone" {
+  description = "DB Subnet 2 availability Zone"
+  type        = string
+  default     = "us-west-1b"
+}
+
+variable "instance_type" {
+  description = "Instance type"
+  type        = string
+  default     = "t2.micro"
+}
+
+variable "instance_image_id" {
+  description = "instance image id"
+  type        = string
+  default     = "ami-0e65ed16c9bf1abc7"
+}
+
+variable "instance_private_key" {
+  description = "Instance private key"
+  type        = string
+  default     = "+"
+}
+
+variable "asg_min" {
+  description = "Min numbers of servers in ASG"
+  type        = string
+  default     = "0"
+}
+
+variable "asg_max" {
+  description = "Max numbers of servers in ASG"
+  type        = string
+  default     = "1"
+}
+
+variable "asg_desired" {
+  description = "Desired numbers of servers in ASG"
+  type        = string
+  default     = "1"
+}
+
+variable "alarm-notification" {
+  description = "Phone number to send http-400-error sms notofocation"
+  type        = string
+  default     = "+"
+}
+
+variable "zone_id" {
+  description = "zone id for r53"
+  type        = string
+  default     = "+"
+}
+
+variable "route53_dns" {
+  description = "dns name for route 53"
+  type        = string
+  default     = "yourdomain-name"
+}
+
+
